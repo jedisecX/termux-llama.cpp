@@ -186,8 +186,8 @@ PIP_PACKAGES=(
     "prompt_toolkit"      # advanced terminal input
     "pygments"            # syntax highlighting for self-programming module
     "psutil"              # system info (CPU / RAM / network stats)
-    "beautifulsoup4"      # HTML parsing for web scraping
-    "lxml"                # fast XML/HTML parser backend
+    "beautifulsoup4"      # HTML parsing for mini web browser (WEB module)
+    "lxml"                # fast XML/HTML parser backend for bs4
     "dnspython"           # DNS resolution for network tools
     "scapy"               # packet crafting (network tools, Termux may need root)
     "httpx"               # async HTTP

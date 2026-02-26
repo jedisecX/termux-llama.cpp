@@ -12,6 +12,7 @@
 | **GGUF File Browser** | Interactive terminal browser to select `.gguf` files |
 | **Chat** | Streamed inference via `llama-cpp-python` |
 | **Mood Engine** | Detects sentiment in AI responses → changes colour theme in real-time |
+| **Mini Web Browser** | Shared user+AI terminal browser — fetch, render, follow links, search, bookmarks, inject page into AI context |
 | **RSS Feeds** | Reads any RSS/Atom feed; bundled with BBC, HackerNews, Reuters, Wired, ArsTechnica, AI News |
 | **Network Tools** | Ping, traceroute, DNS, port scan, whois, HTTP GET, system info |
 | **PDF Module** | Import text from PDFs (`pdfplumber`), export conversations/output as PDF (`fpdf2`) |
@@ -55,13 +56,35 @@ llamaui ~/llama-cpp-termux/models/llama-2-7b-chat.Q4_K_M.gguf
 | `?` | Help overlay |
 
 ### Chat Module
-| Key | Action |
-|-----|--------|
+| Key / Command | Action |
+|---------------|--------|
 | `L` | Open GGUF file browser (matrix rain plays on load) |
 | `S` | Set/change system prompt |
 | `C` | Clear conversation history |
 | `X` | Export conversation to PDF |
 | `!temp 0.8` | Set inference temperature |
+| `!browse <url>` | Fetch URL in background → inject page text into AI context → AI summarises |
+| `!web <url>` | Jump to WEB module with URL pre-loaded |
+
+### Web Browser Module (shared user + AI)
+
+The web browser renders HTML as clean terminal text, numbers every hyperlink `[1]…[N]`, and lets both the user and the AI model read and reason about the same page.
+
+| Command | Action |
+|---------|--------|
+| `<url>` or `https://…` | Navigate to URL (adds `https://` if missing) |
+| `<search terms>` | Search DuckDuckGo (no URL needed — just type) |
+| `b` / `f` / `r` | Back / Forward / Reload |
+| `l <n>` | Follow link `[n]` on current page |
+| `links` | List all numbered links on the page |
+| `find <text>` | Search within the current page (shows matching lines) |
+| `bm` | Bookmark the current page (persisted to `~/.llama_bookmarks.json`) |
+| `bml` | List all bookmarks |
+| `bm del <url>` | Remove a bookmark |
+| `ask <question>` | Send page text + question to AI → switches to Chat with response |
+| `ai` | Inject full page into AI context and ask for a summary |
+| `src` | View raw HTML source (first 3000 chars) |
+| `save` | Export current page as a PDF |
 
 ### RSS Module
 | Input | Action |
@@ -122,7 +145,9 @@ Installed automatically by `install.sh`:
 ```
 llama-cpp-python   # GGUF inference backend
 feedparser         # RSS/Atom parsing
-requests           # HTTP networking
+requests           # HTTP networking + web browser
+beautifulsoup4     # HTML→text rendering for web browser
+lxml               # Fast XML/HTML parser backend for bs4
 fpdf2              # PDF generation / export
 pdfplumber         # PDF text extraction
 psutil             # System info
@@ -130,7 +155,6 @@ dnspython          # Full DNS record lookups
 rich               # Terminal formatting
 prompt_toolkit     # Advanced input
 pygments           # Syntax highlighting
-beautifulsoup4     # HTML parsing
 httpx              # Async HTTP
 ```
 

@@ -81,6 +81,18 @@ try:
 except ImportError:
     DNS_AVAILABLE = False
 
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+
+try:
+    from urllib.parse import urljoin, urlparse, urlunparse
+    URLLIB_AVAILABLE = True
+except ImportError:
+    URLLIB_AVAILABLE = False
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "TERMUX LLAMA.CPP UI"
 APP_VERSION = "1.0.0"
@@ -715,6 +727,344 @@ class SelfProgramModule:
 
 
 # =============================================================================
+#  MINI WEB BROWSER
+# =============================================================================
+class WebBrowser:
+    """
+    Terminal web browser shared between the user and the AI.
+
+    • Fetches pages via requests, strips HTML to readable text
+    • Numbers all hyperlinks [1]…[N] for keyboard navigation
+    • Back / forward history stack
+    • Bookmarks persisted to ~/.llama_bookmarks.json
+    • inject_context() returns page text suitable for injecting into the LLM
+    • find() simple in-page text search
+    • save_pdf() exports the current page to PDF via PDFModule
+    """
+
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 12; Termux) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120 Mobile Safari/537.36 termux-llama-ui/1.0"
+        ),
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    BOOKMARKS_FILE = os.path.join(
+        os.path.expanduser("~"), ".llama_bookmarks.json"
+    )
+    # HTML tags whose content we keep as-is (roughly block-level)
+    BLOCK_TAGS = {"p", "div", "br", "li", "h1", "h2", "h3", "h4",
+                  "h5", "h6", "tr", "td", "th", "blockquote", "pre",
+                  "article", "section", "header", "footer", "main"}
+    # Tags to skip entirely (scripts, styles, nav noise)
+    SKIP_TAGS  = {"script", "style", "nav", "noscript", "iframe",
+                  "svg", "img", "input", "button", "form", "aside",
+                  "meta", "link", "head"}
+
+    def __init__(self):
+        self.current_url:  str = ""
+        self.current_text: str = ""          # rendered plain-text of current page
+        self.current_title: str = ""
+        self.current_links: List[Tuple[int, str, str]] = []  # (n, text, href)
+        self.history:  List[str] = []        # URL stack for back
+        self.forward:  List[str] = []        # URL stack for forward
+        self.bookmarks: Dict[str, str] = {}  # url → title
+        self._load_bookmarks()
+
+    # ── Public navigation ─────────────────────────────────────────────────────
+    def go(self, url: str) -> Tuple[bool, str]:
+        """Fetch URL and render. Returns (success, message)."""
+        url = self._normalise_url(url)
+        if not REQUESTS_AVAILABLE:
+            return False, "[requests not installed – pip install requests]"
+        try:
+            resp = requests.get(url, headers=self.HEADERS,
+                                timeout=15, allow_redirects=True)
+            final_url = resp.url
+            ct = resp.headers.get("Content-Type", "")
+            if "text/html" in ct or "text/plain" in ct or not ct:
+                if self.current_url:
+                    self.history.append(self.current_url)
+                    self.forward.clear()
+                self.current_url = final_url
+                text, title, links = self._render(resp.text, final_url)
+                self.current_text  = text
+                self.current_title = title
+                self.current_links = links
+                return True, f"OK  {resp.status_code}  {final_url}"
+            else:
+                return False, f"[Unsupported content-type: {ct}]"
+        except requests.exceptions.SSLError:
+            return False, "[SSL error – try http:// instead]"
+        except requests.exceptions.ConnectionError as e:
+            return False, f"[Connection error: {e}]"
+        except Exception as e:
+            return False, f"[Fetch error: {e}]"
+
+    def back(self) -> Tuple[bool, str]:
+        if not self.history:
+            return False, "[No history]"
+        self.forward.append(self.current_url)
+        prev = self.history.pop()
+        ok, msg = self.go(prev)
+        if ok:
+            self.history = self.history[:-1]   # go() pushed again; undo that
+        return ok, msg
+
+    def forward_nav(self) -> Tuple[bool, str]:
+        if not self.forward:
+            return False, "[Nothing to go forward to]"
+        nxt = self.forward.pop()
+        return self.go(nxt)
+
+    def follow_link(self, n: int) -> Tuple[bool, str]:
+        for idx, text, href in self.current_links:
+            if idx == n:
+                return self.go(href)
+        return False, f"[No link [{n}] on this page]"
+
+    def reload(self) -> Tuple[bool, str]:
+        if not self.current_url:
+            return False, "[Nothing loaded]"
+        url = self.current_url
+        self.history.append(url)   # preserve stack; go() will push again, cleaned below
+        ok, msg = self.go(url)
+        if ok:
+            self.history = self.history[:-1]
+        return ok, msg
+
+    # ── Search ────────────────────────────────────────────────────────────────
+    def find(self, query: str) -> List[Tuple[int, str]]:
+        """Return (line_no, line_text) for lines containing query (case-insensitive)."""
+        if not self.current_text:
+            return []
+        results = []
+        q = query.lower()
+        for i, line in enumerate(self.current_text.splitlines(), 1):
+            if q in line.lower():
+                results.append((i, line))
+        return results[:50]
+
+    # ── Bookmarks ─────────────────────────────────────────────────────────────
+    def add_bookmark(self) -> str:
+        if not self.current_url:
+            return "[No page loaded]"
+        self.bookmarks[self.current_url] = self.current_title or self.current_url
+        self._save_bookmarks()
+        return f"Bookmarked: {self.current_title or self.current_url}"
+
+    def remove_bookmark(self, url: str) -> str:
+        url = self._normalise_url(url)
+        if url in self.bookmarks:
+            del self.bookmarks[url]
+            self._save_bookmarks()
+            return f"Removed: {url}"
+        return "[Bookmark not found]"
+
+    def _load_bookmarks(self):
+        try:
+            if os.path.exists(self.BOOKMARKS_FILE):
+                with open(self.BOOKMARKS_FILE) as f:
+                    self.bookmarks = json.load(f)
+        except Exception:
+            self.bookmarks = {}
+
+    def _save_bookmarks(self):
+        try:
+            with open(self.BOOKMARKS_FILE, "w") as f:
+                json.dump(self.bookmarks, f, indent=2)
+        except Exception:
+            pass
+
+    # ── AI context injection ──────────────────────────────────────────────────
+    def inject_context(self, max_chars: int = 4000) -> str:
+        """Return a prompt-friendly summary of the current page for the LLM."""
+        if not self.current_url:
+            return "[No page loaded in browser]"
+        header = (
+            f"[Web page fetched by user]\n"
+            f"URL   : {self.current_url}\n"
+            f"Title : {self.current_title}\n"
+            f"─────────────────────────────────\n"
+        )
+        body = self.current_text[:max_chars]
+        if len(self.current_text) > max_chars:
+            body += "\n… (truncated)"
+        return header + body
+
+    # ── Rendering ─────────────────────────────────────────────────────────────
+    def _render(self, html: str, base_url: str
+                ) -> Tuple[str, str, List[Tuple[int, str, str]]]:
+        """Convert HTML → (plain text, page title, numbered links list)."""
+        if BS4_AVAILABLE:
+            return self._render_bs4(html, base_url)
+        return self._render_regex(html, base_url)
+
+    def _render_bs4(self, html: str, base_url: str
+                    ) -> Tuple[str, str, List[Tuple[int, str, str]]]:
+        soup  = BeautifulSoup(html, "html.parser")
+        title = soup.title.string.strip() if soup.title else urlparse(base_url).netloc
+
+        # Remove noise tags
+        for tag in soup(list(self.SKIP_TAGS)):
+            tag.decompose()
+
+        lines: List[str] = []
+        link_counter = [0]
+        links: List[Tuple[int, str, str]] = []
+
+        def _visit(el):
+            if hasattr(el, "name"):
+                name = el.name or ""
+                if name in self.SKIP_TAGS:
+                    return
+                if name == "a":
+                    href = el.get("href", "")
+                    text = el.get_text(" ", strip=True)
+                    if href and text:
+                        abs_href = urljoin(base_url, href)
+                        link_counter[0] += 1
+                        n = link_counter[0]
+                        links.append((n, text[:60], abs_href))
+                        lines.append(f"[{n}] {text}")
+                    else:
+                        lines.append(el.get_text(" ", strip=True))
+                    return
+                if name in ("h1", "h2", "h3"):
+                    txt = el.get_text(" ", strip=True)
+                    if txt:
+                        sep = "═" if name == "h1" else ("─" if name == "h2" else "·")
+                        lines.append("")
+                        lines.append(sep * min(len(txt), 60))
+                        lines.append(txt)
+                        lines.append(sep * min(len(txt), 60))
+                    return
+                if name in ("h4", "h5", "h6"):
+                    txt = el.get_text(" ", strip=True)
+                    if txt:
+                        lines.append(f"\n▸ {txt}")
+                    return
+                if name == "li":
+                    txt = el.get_text(" ", strip=True)
+                    if txt:
+                        lines.append(f"  • {txt}")
+                    return
+                if name == "hr":
+                    lines.append("─" * 60)
+                    return
+                if name == "br":
+                    lines.append("")
+                    return
+                for child in el.children:
+                    _visit(child)
+                if name in self.BLOCK_TAGS:
+                    if lines and lines[-1] != "":
+                        lines.append("")
+            else:
+                txt = str(el).strip()
+                if txt:
+                    lines.append(txt)
+
+        body = soup.body or soup
+        _visit(body)
+
+        # Collapse excessive blank lines
+        cleaned: List[str] = []
+        prev_blank = False
+        for ln in lines:
+            is_blank = not ln.strip()
+            if is_blank and prev_blank:
+                continue
+            cleaned.append(ln)
+            prev_blank = is_blank
+
+        return "\n".join(cleaned), title, links
+
+    def _render_regex(self, html: str, base_url: str
+                      ) -> Tuple[str, str, List[Tuple[int, str, str]]]:
+        """Fallback plain-regex renderer when bs4 is not available."""
+        # Extract title
+        title_m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+        title   = re.sub(r"<[^>]+>", "", title_m.group(1)).strip() if title_m else ""
+
+        # Remove script/style blocks
+        html = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.I | re.S)
+
+        # Collect links
+        links: List[Tuple[int, str, str]] = []
+        link_n = [0]
+        def repl_link(m):
+            href = m.group(1) or m.group(2)
+            text = re.sub(r"<[^>]+>", "", m.group(3)).strip()
+            if href and text:
+                abs_href = urljoin(base_url, href)
+                link_n[0] += 1
+                links.append((link_n[0], text[:60], abs_href))
+                return f"[{link_n[0]}] {text}"
+            return text
+        html = re.sub(
+            r'<a[^>]+href=["\']([^"\']*)["\'][^>]*>(.*?)</a>'
+            r'|<a[^>]+href=([^ >]+)[^>]*>(.*?)</a>',
+            lambda m: repl_link(m), html, flags=re.I | re.S
+        )
+
+        # Block tags → newlines
+        html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+        html = re.sub(r"</(p|div|li|h[1-6]|tr|blockquote|article|section)>",
+                      "\n", html, flags=re.I)
+        html = re.sub(r"<li[^>]*>", "\n  • ", html, flags=re.I)
+        html = re.sub(r"<h[1-3][^>]*>", "\n── ", html, flags=re.I)
+        html = re.sub(r"<h[4-6][^>]*>", "\n▸ ", html, flags=re.I)
+
+        # Strip all remaining tags
+        text = re.sub(r"<[^>]+>", "", html)
+
+        # Decode common HTML entities
+        for ent, ch in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                        ("&nbsp;", " "), ("&quot;", '"'), ("&#39;", "'")):
+            text = text.replace(ent, ch)
+
+        # Collapse whitespace / blank lines
+        lines = [ln.rstrip() for ln in text.splitlines()]
+        cleaned: List[str] = []
+        prev_blank = False
+        for ln in lines:
+            is_blank = not ln.strip()
+            if is_blank and prev_blank:
+                continue
+            cleaned.append(ln)
+            prev_blank = is_blank
+
+        return "\n".join(cleaned), title, links
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def _normalise_url(url: str) -> str:
+        url = url.strip()
+        if not url:
+            return url
+        if not re.match(r"^https?://", url, re.I):
+            if "/" not in url and "." not in url.split("/")[0]:
+                # Treat as a DuckDuckGo search
+                from urllib.parse import quote_plus
+                return f"https://html.duckduckgo.com/html/?q={quote_plus(url)}"
+            url = "https://" + url
+        return url
+
+    def get_page_summary(self) -> str:
+        """Short one-liner for the status bar."""
+        if not self.current_url:
+            return "No page loaded"
+        title = self.current_title[:30] if self.current_title else "(no title)"
+        hist  = len(self.history)
+        fwd   = len(self.forward)
+        links = len(self.current_links)
+        return f"{title}  [{hist}◀ {fwd}▶]  {links} links"
+
+
+# =============================================================================
 #  LLAMA ENGINE
 # =============================================================================
 class LlamaEngine:
@@ -865,7 +1215,7 @@ class ScrollPad:
 #  MAIN APPLICATION
 # =============================================================================
 class LlamaUI:
-    MODES = ["CHAT", "RSS", "NET", "PDF", "CODE", "INFO"]
+    MODES = ["CHAT", "WEB", "RSS", "NET", "PDF", "CODE", "INFO"]
 
     def __init__(self, stdscr, preload_model: str = ""):
         self.stdscr       = stdscr
@@ -898,6 +1248,10 @@ class LlamaUI:
 
         # Code buffer
         self.last_code_blocks: List[str] = []
+
+        # Web browser
+        self.browser           = WebBrowser()
+        self.browser_find_res: List[Tuple[int, str]] = []  # last find() results
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
     def run(self):
@@ -1015,6 +1369,8 @@ class LlamaUI:
         # Mode-specific input
         elif self.current_mode == "CHAT":
             self._handle_chat_key(key)
+        elif self.current_mode == "WEB":
+            self._handle_web_key(key)
         elif self.current_mode == "RSS":
             self._handle_rss_key(key)
         elif self.current_mode == "NET":
@@ -1035,6 +1391,45 @@ class LlamaUI:
             self.scroll_pad.append("Type a message and press Enter.\n"
                                    "L=Load GGUF  S=System prompt  C=Clear  X=Export PDF\n",
                                    pair=12)
+        elif mode == "WEB":
+            self.scroll_pad.append("── WEB BROWSER ──────────────────────\n", pair=3)
+            if self.browser.current_url:
+                self.scroll_pad.append(
+                    f"Current : {self.browser.current_url}\n"
+                    f"Title   : {self.browser.current_title}\n"
+                    f"Links   : {len(self.browser.current_links)}  "
+                    f"History: {len(self.browser.history)}\n\n",
+                    pair=2
+                )
+                for line in self.browser.current_text[:3000].splitlines():
+                    self.scroll_pad.append(line + "\n", pair=1)
+                if len(self.browser.current_text) > 3000:
+                    self.scroll_pad.append(
+                        f"\n… ({len(self.browser.current_text)-3000} more chars) "
+                        "– scroll or use 'find' to search\n",
+                        pair=13
+                    )
+            else:
+                self.scroll_pad.append(
+                    "No page loaded.\n\n"
+                    "Commands:\n"
+                    "  <url>          – Navigate (https:// added if missing)\n"
+                    "  <search terms> – DuckDuckGo search (no URL needed)\n"
+                    "  b              – Back\n"
+                    "  f              – Forward\n"
+                    "  r              – Reload\n"
+                    "  l <n>          – Follow link [n]\n"
+                    "  links          – List all links on current page\n"
+                    "  find <text>    – Search within page\n"
+                    "  bm             – Bookmark current page\n"
+                    "  bml            – List bookmarks\n"
+                    "  bm del <url>   – Remove bookmark\n"
+                    "  ask <question> – Ask AI about current page\n"
+                    "  ai             – Inject full page into AI context\n"
+                    "  src            – View raw source (first 2000 chars)\n"
+                    "  save           – Export page as PDF\n",
+                    pair=12
+                )
         elif mode == "RSS":
             self.scroll_pad.append("── RSS FEEDS ────────────────────────\n", pair=3)
             self._render_rss_menu()
@@ -1139,6 +1534,41 @@ class LlamaUI:
         elif cmd == "clear":
             self.llama.history.clear()
             self.status_msg = "History cleared"
+        elif cmd.startswith("browse ") or cmd.startswith("browse\t"):
+            # Shared browsing: fetch URL, inject as AI context, ask AI about it
+            url = cmd.split(None, 1)[1].strip()
+            self.scroll_pad.append(f"\n[Browser] Fetching {url}…\n", pair=13)
+            self._redraw()
+            ok, msg = self.browser.go(url)
+            if ok:
+                self.status_msg = f"Browsed: {self.browser.current_title or url}"
+                context = self.browser.inject_context(max_chars=3000)
+                inject_msg = (
+                    f"{context}\n\n"
+                    "Please summarise the key points of this page."
+                )
+                self.scroll_pad.append(
+                    f"[Browser] Loaded: {self.browser.current_title}\n"
+                    f"[Browser] Injecting into AI context…\n",
+                    pair=2
+                )
+                self._start_generation(inject_msg)
+            else:
+                self.scroll_pad.append(f"[Browser] {msg}\n", pair=11)
+                self.status_msg = msg
+        elif cmd.startswith("web "):
+            # Jump to WEB module pre-loaded with a URL
+            url = cmd.split(None, 1)[1].strip()
+            self.current_mode = "WEB"
+            self.scroll_pad.clear()
+            self.scroll_pad.append(f"Fetching {url}…\n", pair=13)
+            self._redraw()
+            ok, fetch_msg = self.browser.go(url)
+            self.status_msg = fetch_msg
+            if ok:
+                self._web_render_page()
+            else:
+                self.scroll_pad.append(fetch_msg + "\n", pair=11)
         else:
             self.status_msg = f"Unknown command: !{cmd}"
 
@@ -1337,6 +1767,236 @@ class LlamaUI:
         if key == ord('r'):
             self._mode_enter()
 
+    # ── Web browser key handler ───────────────────────────────────────────────
+    def _handle_web_key(self, key: int):
+        if key in (curses.KEY_ENTER, 10, 13):
+            cmd = self.input_buf.strip()
+            self.input_buf  = ""
+            self.cursor_pos = 0
+            if not cmd:
+                return
+
+            self.scroll_pad.clear()
+            parts = cmd.split(None, 1)
+            op    = parts[0].lower()
+            arg   = parts[1].strip() if len(parts) > 1 else ""
+
+            # ── Single-letter navigation ──────────────────────────────────
+            if op == "b" and not arg:
+                ok, msg = self.browser.back()
+                self.status_msg = msg
+                if ok:
+                    self._web_render_page()
+                else:
+                    self.scroll_pad.append(msg + "\n", pair=11)
+
+            elif op == "f" and not arg:
+                ok, msg = self.browser.forward_nav()
+                self.status_msg = msg
+                if ok:
+                    self._web_render_page()
+                else:
+                    self.scroll_pad.append(msg + "\n", pair=11)
+
+            elif op == "r" and not arg:
+                self.scroll_pad.append("Reloading…\n", pair=13)
+                self._redraw()
+                ok, msg = self.browser.reload()
+                self.status_msg = msg
+                if ok:
+                    self._web_render_page()
+                else:
+                    self.scroll_pad.append(msg + "\n", pair=11)
+
+            # ── Follow link ───────────────────────────────────────────────
+            elif op == "l" and arg.isdigit():
+                n = int(arg)
+                self.scroll_pad.append(f"Following link [{n}]…\n", pair=13)
+                self._redraw()
+                ok, msg = self.browser.follow_link(n)
+                self.status_msg = msg
+                if ok:
+                    self._web_render_page()
+                else:
+                    self.scroll_pad.append(msg + "\n", pair=11)
+
+            # ── List all links ────────────────────────────────────────────
+            elif op == "links":
+                if not self.browser.current_links:
+                    self.scroll_pad.append("No links on this page.\n", pair=13)
+                else:
+                    self.scroll_pad.append(
+                        f"── {len(self.browser.current_links)} links ──\n\n", pair=2, bold=True
+                    )
+                    for n, text, href in self.browser.current_links:
+                        self.scroll_pad.append(
+                            f"  [{n:3d}] {text[:40]:<40}  {href[:60]}\n", pair=1
+                        )
+
+            # ── In-page search ────────────────────────────────────────────
+            elif op == "find" and arg:
+                results = self.browser.find(arg)
+                self.browser_find_res = results
+                if not results:
+                    self.scroll_pad.append(f"Not found: {arg}\n", pair=13)
+                else:
+                    self.scroll_pad.append(
+                        f"── {len(results)} match(es) for '{arg}' ──\n\n",
+                        pair=2, bold=True
+                    )
+                    for lineno, line in results:
+                        # Highlight match
+                        hi_line = line.replace(
+                            arg, f"[{arg}]"   # simple marker; curses attr not in line
+                        )
+                        self.scroll_pad.append(
+                            f"  L{lineno:4d}: {hi_line[:80]}\n", pair=1
+                        )
+
+            # ── Bookmarks ─────────────────────────────────────────────────
+            elif op == "bm" and not arg:
+                msg = self.browser.add_bookmark()
+                self.status_msg = msg
+                self.scroll_pad.append(msg + "\n", pair=2)
+
+            elif op == "bml":
+                if not self.browser.bookmarks:
+                    self.scroll_pad.append("No bookmarks yet. Use 'bm' to add one.\n", pair=13)
+                else:
+                    self.scroll_pad.append(
+                        f"── {len(self.browser.bookmarks)} bookmarks ──\n\n",
+                        pair=2, bold=True
+                    )
+                    for i, (url, title) in enumerate(self.browser.bookmarks.items(), 1):
+                        self.scroll_pad.append(
+                            f"  [{i:2d}] {title[:40]:<42} {url[:60]}\n", pair=1
+                        )
+                    self.scroll_pad.append(
+                        "\nType the URL (or copy-paste) to navigate to a bookmark.\n",
+                        pair=12
+                    )
+
+            elif op == "bm" and arg.startswith("del "):
+                target = arg[4:].strip()
+                msg = self.browser.remove_bookmark(target)
+                self.status_msg = msg
+                self.scroll_pad.append(msg + "\n", pair=13)
+
+            # ── Ask AI about the current page ─────────────────────────────
+            elif op in ("ai", "ask"):
+                if not self.browser.current_url:
+                    self.scroll_pad.append("[No page loaded]\n", pair=11)
+                    return
+                question = arg if op == "ask" and arg else \
+                           "Summarise this web page concisely."
+                context  = self.browser.inject_context(max_chars=3000)
+                full_prompt = f"{context}\n\nQuestion: {question}"
+                self.scroll_pad.append(
+                    f"Sending page to AI: {self.browser.current_url}\n", pair=13
+                )
+                self.current_mode = "CHAT"
+                self._start_generation(full_prompt)
+
+            # ── View raw source ───────────────────────────────────────────
+            elif op == "src":
+                if not REQUESTS_AVAILABLE:
+                    self.scroll_pad.append("[requests not installed]\n", pair=11)
+                    return
+                if not self.browser.current_url:
+                    self.scroll_pad.append("[No page loaded]\n", pair=11)
+                    return
+                try:
+                    resp = requests.get(
+                        self.browser.current_url,
+                        headers=WebBrowser.HEADERS, timeout=15
+                    )
+                    src = resp.text[:3000]
+                    self.scroll_pad.append(
+                        f"── Source: {self.browser.current_url} ──\n\n", pair=2
+                    )
+                    for line in src.splitlines():
+                        self.scroll_pad.append(line[:160] + "\n", pair=14)
+                    if len(resp.text) > 3000:
+                        self.scroll_pad.append(
+                            f"\n… ({len(resp.text)-3000} more chars)\n", pair=13
+                        )
+                except Exception as e:
+                    self.scroll_pad.append(f"[Error: {e}]\n", pair=11)
+
+            # ── Export page as PDF ────────────────────────────────────────
+            elif op == "save":
+                if not self.browser.current_url:
+                    self.scroll_pad.append("[No page loaded]\n", pair=11)
+                    return
+                pm  = PDFModule()
+                msg = pm.export(
+                    self.browser.current_text,
+                    title=self.browser.current_title or self.browser.current_url
+                )
+                self.status_msg = msg
+                self.scroll_pad.append(msg + "\n", pair=2)
+
+            # ── Navigate to URL / DuckDuckGo search ───────────────────────
+            else:
+                # Anything that doesn't match a command is treated as a URL or search
+                nav_target = cmd  # use full original command
+                self.scroll_pad.append(f"Fetching: {nav_target}\n", pair=13)
+                self._redraw()
+                ok, msg = self.browser.go(nav_target)
+                self.status_msg = msg
+                if ok:
+                    self._web_render_page()
+                else:
+                    self.scroll_pad.append(msg + "\n", pair=11)
+                    self.scroll_pad.append(
+                        "Tip: type any URL or search terms and press Enter.\n", pair=12
+                    )
+
+        elif 32 <= key <= 126:
+            self.input_buf  = self.input_buf[:self.cursor_pos] + chr(key) + \
+                              self.input_buf[self.cursor_pos:]
+            self.cursor_pos += 1
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.cursor_pos > 0:
+                self.input_buf  = self.input_buf[:self.cursor_pos - 1] + \
+                                  self.input_buf[self.cursor_pos:]
+                self.cursor_pos -= 1
+        elif key == curses.KEY_LEFT:
+            self.cursor_pos = max(0, self.cursor_pos - 1)
+        elif key == curses.KEY_RIGHT:
+            self.cursor_pos = min(len(self.input_buf), self.cursor_pos + 1)
+
+    def _web_render_page(self):
+        """Re-render the browser's current page into the scroll pad."""
+        self.scroll_pad.clear()
+        b = self.browser
+        # URL / title bar
+        self.scroll_pad.append(
+            f"  URL  : {b.current_url}\n"
+            f"  Title: {b.current_title}\n"
+            f"  Links: {len(b.current_links)}  │  "
+            f"History: {len(b.history)}  │  Forward: {len(b.forward)}\n",
+            pair=2, bold=True
+        )
+        self.scroll_pad.append("─" * 60 + "\n", pair=3)
+        # Page body
+        for line in b.current_text.splitlines():
+            # Colour headings (detected by ═ / ─ lines) differently
+            stripped = line.strip()
+            if re.match(r"^[═─·]{4,}$", stripped):
+                self.scroll_pad.append(line + "\n", pair=3)
+            elif stripped.startswith("•"):
+                self.scroll_pad.append(line + "\n", pair=1)
+            elif re.match(r"^\[\d+\]", stripped):   # numbered link
+                self.scroll_pad.append(line + "\n", pair=2)
+            else:
+                self.scroll_pad.append(line + "\n", pair=14)
+        self.scroll_pad.append(
+            "\n── Commands: b=back  f=fwd  r=reload  l<n>=link  "
+            "find <q>  bm  bml  ask <q>  ai  save ──\n",
+            pair=12
+        )
+
     # ── Interactive loaders ───────────────────────────────────────────────────
     def _interactive_load(self):
         browser = GGUFBrowser(self.stdscr)
@@ -1398,28 +2058,36 @@ class LlamaUI:
         help_text = [
             "",
             "GLOBAL:",
-            "  Tab          – Cycle modules (Chat/RSS/Net/PDF/Code/Info)",
+            "  Tab          – Cycle modules",
             "  ↑↓ PgUp/Dn   – Scroll output",
             "  Ctrl-C / Q   – Quit",
             "",
             "CHAT MODULE:",
-            "  L            – Open GGUF file browser",
-            "  S            – Set system prompt",
-            "  C            – Clear conversation",
-            "  X            – Export chat to PDF",
-            "  !temp 0.8    – Set temperature",
+            "  L              – Open GGUF file browser",
+            "  S              – Set system prompt",
+            "  C              – Clear conversation",
+            "  X              – Export chat to PDF",
+            "  !temp 0.8      – Set temperature",
+            "  !browse <url>  – Fetch URL → inject to AI",
+            "  !web <url>     – Open URL in WEB module",
+            "",
+            "WEB BROWSER (shared user+AI):",
+            "  <url> or terms – Navigate / DuckDuckGo search",
+            "  b / f / r      – Back / Forward / Reload",
+            "  l <n>          – Follow link [n]",
+            "  links          – List all links",
+            "  find <text>    – In-page search",
+            "  bm / bml       – Bookmark / List bookmarks",
+            "  ask <question> – Ask AI about page",
+            "  ai             – Inject page into AI context",
+            "  save           – Export page to PDF",
             "",
             "RSS MODULE:",
             "  1–N          – Fetch feed N",
             "  add Name URL – Add custom feed",
             "",
             "NETWORK MODULE:",
-            "  p <host>       – Ping",
-            "  t <host>       – Traceroute",
-            "  d <host>       – DNS lookup",
-            "  s <host> [prt] – Port scan",
-            "  g <url>        – HTTP GET",
-            "  i              – System info",
+            "  p/t/d/s/w/g/i  – ping/trace/dns/scan/whois/get/info",
             "",
             "PDF MODULE:",
             "  r <path>   – Import / read PDF",
@@ -1427,9 +2095,7 @@ class LlamaUI:
             "",
             "CODE MODULE:",
             "  g <desc>   – Generate code with AI",
-            "  v [n]      – View block n",
-            "  save [n]   – Save block",
-            "  run [n]    – Run snippet",
+            "  v/save/run/list",
             "",
             "  Press any key to close…",
         ]
@@ -1465,10 +2131,14 @@ class LlamaUI:
         mood_info  = MOODS.get(self.current_mood, MOODS["neutral"])
         model_name = self.llama.model_name or "No model"
         gen_marker = " ◌ GENERATING" if self.is_generating else ""
+        if self.current_mode == "WEB" and self.browser.current_url:
+            web_info = f"  │  {self.browser.current_url[:40]}"
+        else:
+            web_info = ""
         header = (
             f" {APP_NAME}  │  [{self.current_mode}]  │  "
             f"Model: {model_name[:20]}  │  "
-            f"Mood: {mood_info['label']}{gen_marker} "
+            f"Mood: {mood_info['label']}{gen_marker}{web_info} "
         )
         try:
             self.stdscr.addstr(0, 0, header[:w].ljust(w), CE.pair(5, bold=True))
@@ -1512,6 +2182,7 @@ class LlamaUI:
             "req":    REQUESTS_AVAILABLE,
             "pdf":    FPDF_AVAILABLE,
             "plumb":  PDFPLUMBER_AVAILABLE,
+            "bs4":    BS4_AVAILABLE,
         }
         status_flags = "  ".join(
             f"{k}:{'✓' if v else '✗'}" for k, v in avail.items()
@@ -1527,7 +2198,8 @@ class LlamaUI:
 
         # ── Input line ────────────────────────────────────────────────────────
         mode_prompt = {
-            "CHAT": "Chat",
+            "CHAT": "Chat (!browse url / !web url)",
+            "WEB":  "Web (url / search / b f r l<n> find ask ai bm bml save)",
             "RSS":  "RSS (1–N / add Name URL)",
             "NET":  "Net (p/t/d/s/g/i host)",
             "PDF":  "PDF (r path / e / ec text)",
