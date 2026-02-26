@@ -1065,6 +1065,150 @@ class WebBrowser:
 
 
 # =============================================================================
+#  CLIPBOARD HELPER
+# =============================================================================
+class ClipboardHelper:
+    """
+    Copy text to the system clipboard using the best available backend:
+      1. termux-clipboard-set  (Termux:API app — recommended)
+      2. xclip / xsel          (desktop Linux fallback)
+      3. Save to ~/llama_clipboard.txt  (always works)
+    Also supports termux-toast for brief on-screen confirmations.
+    """
+
+    CLIPBOARD_FILE = os.path.join(os.path.expanduser("~"), "llama_clipboard.txt")
+
+    def copy(self, text: str) -> str:
+        """Copy text to clipboard. Returns a human-readable status string."""
+        n = len(text)
+
+        # ── 1. termux-clipboard-set ───────────────────────────────────────────
+        if shutil.which("termux-clipboard-set"):
+            try:
+                subprocess.run(
+                    ["termux-clipboard-set"],
+                    input=text.encode("utf-8", errors="replace"),
+                    timeout=5, check=True
+                )
+                self._toast(f"Copied {n} chars")
+                return f"Copied {n} chars → Termux clipboard"
+            except Exception:
+                pass
+
+        # ── 2. xclip ─────────────────────────────────────────────────────────
+        for cmd in (["xclip", "-selection", "clipboard"],
+                    ["xsel", "--clipboard", "--input"]):
+            if shutil.which(cmd[0]):
+                try:
+                    subprocess.run(
+                        cmd,
+                        input=text.encode("utf-8", errors="replace"),
+                        timeout=5, check=True
+                    )
+                    return f"Copied {n} chars → system clipboard ({cmd[0]})"
+                except Exception:
+                    pass
+
+        # ── 3. File fallback ──────────────────────────────────────────────────
+        try:
+            with open(self.CLIPBOARD_FILE, "w", encoding="utf-8") as f:
+                f.write(text)
+            return f"Saved {n} chars → {self.CLIPBOARD_FILE}  (termux-clipboard-set not found)"
+        except Exception as e:
+            return f"[Clipboard error: {e}]"
+
+    @staticmethod
+    def _toast(msg: str):
+        if shutil.which("termux-toast"):
+            try:
+                subprocess.run(
+                    ["termux-toast", "-s", msg],
+                    timeout=3
+                )
+            except Exception:
+                pass
+
+    @staticmethod
+    def notify(title: str, body: str):
+        """Fire a Termux notification (requires Termux:API)."""
+        if shutil.which("termux-notification"):
+            try:
+                subprocess.run(
+                    ["termux-notification",
+                     "--title", title,
+                     "--content", body,
+                     "--id", "llama-ui"],
+                    timeout=5
+                )
+            except Exception:
+                pass
+
+
+# =============================================================================
+#  SESSION MANAGER
+# =============================================================================
+class SessionManager:
+    """Save and restore named conversation sessions to JSON files."""
+
+    SESSION_DIR = os.path.join(
+        os.path.expanduser("~"), "llama-cpp-termux", "sessions"
+    )
+
+    def __init__(self):
+        os.makedirs(self.SESSION_DIR, exist_ok=True)
+
+    def save(self, name: str, history: List[Dict[str, str]],
+             model_name: str = "", system_prompt: str = "") -> str:
+        if not name.endswith(".json"):
+            name += ".json"
+        path = os.path.join(self.SESSION_DIR, name)
+        data = {
+            "saved":         datetime.now().isoformat(),
+            "model":         model_name,
+            "system_prompt": system_prompt,
+            "history":       history,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            return f"Session saved: {path}"
+        except Exception as e:
+            return f"[Save error: {e}]"
+
+    def load(self, name: str) -> Tuple[bool, str, Dict]:
+        if not name.endswith(".json"):
+            name += ".json"
+        path = os.path.join(self.SESSION_DIR, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return True, f"Session loaded: {name}", data
+        except FileNotFoundError:
+            return False, f"[Session not found: {path}]", {}
+        except Exception as e:
+            return False, f"[Load error: {e}]", {}
+
+    def list_sessions(self) -> List[Tuple[str, str]]:
+        """Return [(filename, saved_date)] sorted newest-first."""
+        results = []
+        try:
+            for p in sorted(Path(self.SESSION_DIR).glob("*.json"),
+                            key=lambda x: x.stat().st_mtime, reverse=True):
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        d = json.load(f)
+                    saved = d.get("saved", "?")[:19]
+                    model = d.get("model", "?")
+                    turns = len(d.get("history", []))
+                    results.append((p.name, f"{saved}  model={model}  {turns} msgs"))
+                except Exception:
+                    results.append((p.name, "(unreadable)"))
+        except Exception:
+            pass
+        return results
+
+
+# =============================================================================
 #  LLAMA ENGINE
 # =============================================================================
 class LlamaEngine:
@@ -1169,18 +1313,33 @@ class ScrollPad:
         self.offset    = 0
         self.start_row = start_row
         self.start_col = start_col
+        self.auto_scroll = True          # toggleable via 'a' key in CHAT
 
     def append(self, text: str, pair: int = 1, bold: bool = False):
         attr = CE.pair(pair, bold)
         for line in str(text).splitlines():
             self.lines.append((line, attr))
-        self._auto_scroll()
+        if self.auto_scroll:
+            self._auto_scroll()
 
     def _auto_scroll(self):
         h, w = self.win.getmaxyx()
         visible = h - self.start_row - 1
         if len(self.lines) > self.offset + visible:
             self.offset = max(0, len(self.lines) - visible)
+
+    def scroll_to_bottom(self):
+        """Force-jump to the bottom regardless of auto_scroll flag."""
+        h, _ = self.win.getmaxyx()
+        visible = h - self.start_row - 1
+        self.offset = max(0, len(self.lines) - visible)
+
+    def scroll_pos(self) -> Tuple[int, int]:
+        """Return (current_line, total_lines)."""
+        h, _ = self.win.getmaxyx()
+        visible = h - self.start_row - 1
+        cur = self.offset + visible
+        return min(cur, len(self.lines)), max(len(self.lines), 1)
 
     def scroll_up(self, n: int = 3):
         self.offset = max(0, self.offset - n)
@@ -1251,7 +1410,27 @@ class LlamaUI:
 
         # Web browser
         self.browser           = WebBrowser()
-        self.browser_find_res: List[Tuple[int, str]] = []  # last find() results
+        self.browser_find_res: List[Tuple[int, str]] = []
+
+        # Clipboard + sessions
+        self.clipboard          = ClipboardHelper()
+        self.session_mgr        = SessionManager()
+        self.last_ai_response:  str = ""   # text of the most-recent AI reply
+        self.all_ai_responses:  List[str] = []  # every AI reply this session
+
+        # Input history (shell-style ↑↓ recall)
+        self.input_history: List[str] = []   # submitted messages, oldest→newest
+        self.input_hist_idx: int = -1         # -1 = live draft, 0=most-recent
+        self.input_draft:   str = ""          # saved draft while navigating history
+
+        # In-pad search
+        self.search_active:  bool = False
+        self.search_query:   str = ""
+        self.search_matches: List[int] = []   # line indices in scroll_pad
+        self.search_match_idx: int = 0
+
+        # Termux notifications on generation complete
+        self.notify_done: bool = bool(shutil.which("termux-notification"))
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
     def run(self):
@@ -1301,7 +1480,15 @@ class LlamaUI:
         if self.is_generating:
             return
         self.is_generating = True
-        self.scroll_pad.append(f"\nYou: {prompt}\n", pair=2, bold=True)
+        # Track input history (skip prompts that are injected context)
+        if not prompt.startswith("[Web page fetched"):
+            if not self.input_history or self.input_history[-1] != prompt:
+                self.input_history.append(prompt)
+        self.input_hist_idx = -1
+        self.input_draft    = ""
+
+        self.scroll_pad.append(f"\nYou: {prompt[:120]}{'…' if len(prompt)>120 else ''}\n",
+                               pair=2, bold=True)
         self.scroll_pad.append("AI : ", pair=1)
 
         def _worker():
@@ -1311,6 +1498,9 @@ class LlamaUI:
                 self.token_queue.put(tok)
             self.llama.generate(prompt, on_token=on_token)
             joined = "".join(full_response)
+            # Store for clipboard access
+            self.last_ai_response = joined
+            self.all_ai_responses.append(joined)
             self.mood_engine.update(joined)
             self.last_code_blocks = self.code_mod.extract_code_blocks(joined)
             if self.last_code_blocks:
@@ -1319,6 +1509,10 @@ class LlamaUI:
                     f"switch to CODE mode to manage]\n"
                 )
             self.token_queue.put(None)  # sentinel
+            # Termux notification
+            if self.notify_done:
+                preview = joined[:80].replace("\n", " ")
+                ClipboardHelper.notify("LlamaUI — done", preview)
 
         self.gen_thread = threading.Thread(target=_worker, daemon=True)
         self.gen_thread.start()
@@ -1361,8 +1555,17 @@ class LlamaUI:
             self._mode_enter()
             return
 
-        if key == curses.KEY_UP:        self.scroll_pad.scroll_up()
-        elif key == curses.KEY_DOWN:    self.scroll_pad.scroll_down()
+        # ↑↓ in CHAT: navigate input history if there's text OR if already in history
+        if key == curses.KEY_UP:
+            if self.current_mode == "CHAT" and (self.input_buf or self.input_hist_idx >= 0):
+                self._history_up()
+            else:
+                self.scroll_pad.scroll_up()
+        elif key == curses.KEY_DOWN:
+            if self.current_mode == "CHAT" and self.input_hist_idx >= 0:
+                self._history_down()
+            else:
+                self.scroll_pad.scroll_down()
         elif key == curses.KEY_PPAGE:   self.scroll_pad.scroll_up(10)
         elif key == curses.KEY_NPAGE:   self.scroll_pad.scroll_down(10)
 
@@ -1388,9 +1591,13 @@ class LlamaUI:
 
         if mode == "CHAT":
             self.scroll_pad.append("── CHAT ─────────────────────────────\n", pair=3)
-            self.scroll_pad.append("Type a message and press Enter.\n"
-                                   "L=Load GGUF  S=System prompt  C=Clear  X=Export PDF\n",
-                                   pair=12)
+            self.scroll_pad.append(
+                "Type a message and press Enter.\n"
+                "L=Load  S=Prompt  C=Clear  X=PDF  "
+                "y=Copy last AI  Y=Copy all AI  Ctrl+A=Copy screen\n"
+                "↑↓=Input history  /=Search  a=Toggle autoscroll  ?=Help\n",
+                pair=12
+            )
         elif mode == "WEB":
             self.scroll_pad.append("── WEB BROWSER ──────────────────────\n", pair=3)
             if self.browser.current_url:
@@ -1480,18 +1687,110 @@ class LlamaUI:
                                    "  Ctrl+C/Q   – Quit\n"
                                    "  ?          – This screen\n", pair=12)
 
+    # ── Input history helpers ─────────────────────────────────────────────────
+    def _history_up(self):
+        if not self.input_history:
+            return
+        if self.input_hist_idx == -1:
+            self.input_draft   = self.input_buf   # save current draft
+            self.input_hist_idx = len(self.input_history) - 1
+        elif self.input_hist_idx > 0:
+            self.input_hist_idx -= 1
+        self.input_buf   = self.input_history[self.input_hist_idx]
+        self.cursor_pos  = len(self.input_buf)
+
+    def _history_down(self):
+        if self.input_hist_idx == -1:
+            return
+        self.input_hist_idx += 1
+        if self.input_hist_idx >= len(self.input_history):
+            self.input_hist_idx = -1
+            self.input_buf      = self.input_draft
+        else:
+            self.input_buf = self.input_history[self.input_hist_idx]
+        self.cursor_pos = len(self.input_buf)
+
+    # ── In-pad search helpers ─────────────────────────────────────────────────
+    def _search_start(self):
+        """Open a mini search bar and highlight matches."""
+        h, w = self.stdscr.getmaxyx()
+        dlg_h, dlg_w = 3, min(50, w - 4)
+        dy = h - 6
+        dx = (w - dlg_w) // 2
+        dlg = curses.newwin(dlg_h, dlg_w, dy, dx)
+        dlg.keypad(True)
+        dlg.border()
+        dlg.addstr(1, 2, "Search: ", CE.pair(2, bold=True))
+        dlg.refresh()
+        curses.echo()
+        curses.curs_set(1)
+        try:
+            query = dlg.getstr(1, 10, dlg_w - 12).decode("utf-8", errors="replace")
+        except Exception:
+            query = ""
+        curses.noecho()
+        del dlg
+        self.stdscr.touchwin()
+        if not query.strip():
+            return
+        self.search_query   = query.lower()
+        self.search_matches = [
+            i for i, (line, _) in enumerate(self.scroll_pad.lines)
+            if self.search_query in line.lower()
+        ]
+        self.search_match_idx = 0
+        if self.search_matches:
+            self.scroll_pad.offset = max(0, self.search_matches[0] - 3)
+            self.status_msg = (
+                f"Search '{query}': {len(self.search_matches)} match(es) – "
+                "n=next  N=prev  Esc=clear"
+            )
+        else:
+            self.status_msg = f"Not found: '{query}'"
+
+    def _search_next(self, direction: int = 1):
+        if not self.search_matches:
+            return
+        self.search_match_idx = (
+            (self.search_match_idx + direction) % len(self.search_matches)
+        )
+        line_idx = self.search_matches[self.search_match_idx]
+        self.scroll_pad.offset = max(0, line_idx - 3)
+        self.status_msg = (
+            f"Match {self.search_match_idx+1}/{len(self.search_matches)}: "
+            f"'{self.search_query}'"
+        )
+
+    # ── Clipboard flash overlay ───────────────────────────────────────────────
+    def _flash_copied(self, label: str = "COPIED!"):
+        """Brief inverted-colour flash centred on screen."""
+        h, w = self.stdscr.getmaxyx()
+        msg   = f"  {label}  "
+        bx    = (w - len(msg)) // 2
+        by    = h // 2
+        try:
+            self.stdscr.addstr(by, bx, msg, CE.pair(16) | curses.A_BOLD)
+            self.stdscr.refresh()
+            time.sleep(0.45)
+        except curses.error:
+            pass
+
     # ── CHAT key handler ──────────────────────────────────────────────────────
     def _handle_chat_key(self, key: int):
+        empty = not self.input_buf
+
         if key in (curses.KEY_ENTER, 10, 13):
             if not self.input_buf.strip():
                 return
             cmd = self.input_buf.strip()
-            self.input_buf  = ""
-            self.cursor_pos = 0
+            self.input_buf      = ""
+            self.cursor_pos     = 0
+            self.input_hist_idx = -1
             if cmd.startswith("!"):
                 self._chat_command(cmd[1:])
             else:
                 self._start_generation(cmd)
+
         elif key in (curses.KEY_BACKSPACE, 127, 8):
             if self.cursor_pos > 0:
                 self.input_buf  = self.input_buf[:self.cursor_pos - 1] + \
@@ -1501,24 +1800,80 @@ class LlamaUI:
             self.cursor_pos = max(0, self.cursor_pos - 1)
         elif key == curses.KEY_RIGHT:
             self.cursor_pos = min(len(self.input_buf), self.cursor_pos + 1)
-        elif key == ord('l') and not self.input_buf:
+        elif key == curses.KEY_HOME:
+            self.cursor_pos = 0
+        elif key == curses.KEY_END:
+            self.cursor_pos = len(self.input_buf)
+
+        # ── Copy / yank ───────────────────────────────────────────────────────
+        elif key == ord('y') and empty:
+            # yank LAST AI response
+            if self.last_ai_response:
+                result = self.clipboard.copy(self.last_ai_response)
+                self.status_msg = result
+                self._flash_copied("COPIED LAST AI RESPONSE")
+            else:
+                self.status_msg = "No AI response yet"
+
+        elif key == ord('Y') and empty:
+            # yank ALL AI responses concatenated
+            if self.all_ai_responses:
+                combined = "\n\n---\n\n".join(self.all_ai_responses)
+                result   = self.clipboard.copy(combined)
+                self.status_msg = result
+                self._flash_copied(f"COPIED {len(self.all_ai_responses)} RESPONSES")
+            else:
+                self.status_msg = "No AI responses yet"
+
+        elif key == 1 and empty:
+            # Ctrl+A — select ALL (copy entire scroll pad)
+            text   = self.scroll_pad.get_text()
+            result = self.clipboard.copy(text)
+            self.status_msg = result
+            self._flash_copied("COPIED ALL TEXT")
+
+        # ── Auto-scroll toggle ────────────────────────────────────────────────
+        elif key == ord('a') and empty:
+            self.scroll_pad.auto_scroll = not self.scroll_pad.auto_scroll
+            state = "ON" if self.scroll_pad.auto_scroll else "OFF (scroll freely)"
+            self.status_msg = f"Auto-scroll {state}"
+            if self.scroll_pad.auto_scroll:
+                self.scroll_pad.scroll_to_bottom()
+
+        # ── In-pad search ─────────────────────────────────────────────────────
+        elif key == ord('/') and empty:
+            self._search_start()
+        elif key == ord('n') and empty and self.search_matches:
+            self._search_next(1)
+        elif key == ord('N') and empty and self.search_matches:
+            self._search_next(-1)
+        elif key == 27 and self.search_matches:   # ESC clears search
+            self.search_matches = []
+            self.search_query   = ""
+            self.status_msg     = "Search cleared"
+
+        # ── Other CHAT shortcuts ──────────────────────────────────────────────
+        elif key == ord('l') and empty:
             self._interactive_load()
-        elif key == ord('s') and not self.input_buf:
+        elif key == ord('s') and empty:
             self._set_system_prompt()
-        elif key == ord('c') and not self.input_buf:
+        elif key == ord('c') and empty:
             self.scroll_pad.clear()
             self.llama.history.clear()
+            self.all_ai_responses.clear()
+            self.last_ai_response = ""
             self.scroll_pad.append("(conversation cleared)\n", pair=13)
-        elif key == ord('x') and not self.input_buf:
+        elif key == ord('x') and empty:
             result = self.pdf.export(
                 self.scroll_pad.get_text(),
                 title=f"LlamaUI Chat — {self.llama.model_name or 'No model'}"
             )
             self.status_msg = result
-        elif key == ord('q') and not self.input_buf:
+        elif key == ord('q') and empty:
             self.running = False
-        elif key == ord('?') and not self.input_buf:
+        elif key == ord('?') and empty:
             self._show_help()
+
         elif 32 <= key <= 126:
             self.input_buf  = self.input_buf[:self.cursor_pos] + chr(key) + \
                               self.input_buf[self.cursor_pos:]
@@ -1569,6 +1924,56 @@ class LlamaUI:
                 self._web_render_page()
             else:
                 self.scroll_pad.append(fetch_msg + "\n", pair=11)
+        elif cmd.startswith("save") or cmd.startswith("session save"):
+            parts = cmd.split(None, 2)
+            name  = parts[-1] if len(parts) >= 2 else \
+                    f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            result = self.session_mgr.save(
+                name, self.llama.history,
+                self.llama.model_name, self.llama.system_prompt
+            )
+            self.status_msg = result
+            self.scroll_pad.append(result + "\n", pair=2)
+        elif cmd.startswith("load ") or cmd.startswith("session load "):
+            parts = cmd.split(None, 2)
+            name  = parts[-1]
+            ok, msg, data = self.session_mgr.load(name)
+            self.status_msg = msg
+            if ok:
+                self.llama.history = data.get("history", [])
+                sp = data.get("system_prompt", "")
+                if sp:
+                    self.llama.system_prompt = sp
+                self.scroll_pad.append(f"{msg}\n", pair=2)
+                self.scroll_pad.append(
+                    f"  Model    : {data.get('model','?')}\n"
+                    f"  Messages : {len(self.llama.history)}\n"
+                    f"  Saved    : {data.get('saved','?')}\n",
+                    pair=12
+                )
+            else:
+                self.scroll_pad.append(msg + "\n", pair=11)
+        elif cmd in ("sessions", "session list", "ls"):
+            sessions = self.session_mgr.list_sessions()
+            if not sessions:
+                self.scroll_pad.append("No saved sessions yet.\n", pair=13)
+            else:
+                self.scroll_pad.append(
+                    f"── {len(sessions)} session(s) in "
+                    f"{self.session_mgr.SESSION_DIR} ──\n",
+                    pair=2, bold=True
+                )
+                for name, info in sessions:
+                    self.scroll_pad.append(f"  {name:<30} {info}\n", pair=1)
+                self.scroll_pad.append(
+                    "\nLoad with: !load <name>\n", pair=12
+                )
+        elif cmd == "notify on":
+            self.notify_done = True
+            self.status_msg  = "Termux notifications ON"
+        elif cmd == "notify off":
+            self.notify_done = False
+            self.status_msg  = "Termux notifications OFF"
         else:
             self.status_msg = f"Unknown command: !{cmd}"
 
@@ -2063,13 +2468,25 @@ class LlamaUI:
             "  Ctrl-C / Q   – Quit",
             "",
             "CHAT MODULE:",
-            "  L              – Open GGUF file browser",
+            "  L              – Load GGUF (file browser)",
             "  S              – Set system prompt",
             "  C              – Clear conversation",
             "  X              – Export chat to PDF",
+            "  y              – Copy last AI response to clipboard",
+            "  Y              – Copy ALL AI responses to clipboard",
+            "  Ctrl+A         – Copy entire screen to clipboard",
+            "  ↑↓             – Recall input history (shell-style)",
+            "  /              – Search through conversation",
+            "  n / N          – Next / prev search match",
+            "  Esc            – Clear search highlights",
+            "  a              – Toggle auto-scroll (⟳/⏸ in status bar)",
             "  !temp 0.8      – Set temperature",
             "  !browse <url>  – Fetch URL → inject to AI",
             "  !web <url>     – Open URL in WEB module",
+            "  !save [name]   – Save conversation session",
+            "  !load <name>   – Load saved session",
+            "  !sessions      – List saved sessions",
+            "  !notify on/off – Toggle completion notifications",
             "",
             "WEB BROWSER (shared user+AI):",
             "  <url> or terms – Navigate / DuckDuckGo search",
@@ -2175,6 +2592,24 @@ class LlamaUI:
         except curses.error:
             pass
 
+        # ── Search highlight overlay on scroll pad ────────────────────────────
+        if self.search_matches and self.search_query:
+            h2, w2 = self.stdscr.getmaxyx()
+            visible_start = self.scroll_pad.offset
+            visible_end   = visible_start + (h2 - self.scroll_pad.start_row - 4)
+            for idx in self.search_matches:
+                row = self.scroll_pad.start_row + (idx - visible_start)
+                if self.scroll_pad.start_row <= row < h2 - 4:
+                    line, _ = self.scroll_pad.lines[idx]
+                    # Highlight the line
+                    is_current = (self.search_matches[self.search_match_idx] == idx)
+                    attr = CE.pair(16) | curses.A_BOLD if is_current else \
+                           CE.pair(13)
+                    try:
+                        self.stdscr.addstr(row, 0, line[:w2 - 1], attr)
+                    except curses.error:
+                        pass
+
         # ── Status bar ────────────────────────────────────────────────────────
         avail = {
             "llama":  LLAMA_AVAILABLE,
@@ -2187,7 +2622,16 @@ class LlamaUI:
         status_flags = "  ".join(
             f"{k}:{'✓' if v else '✗'}" for k, v in avail.items()
         )
-        status_right = f" {status_flags} "
+        # Scroll position
+        cur_ln, tot_ln = self.scroll_pad.scroll_pos()
+        pct = int(cur_ln / tot_ln * 100) if tot_ln else 100
+        scroll_info = f" {cur_ln}/{tot_ln} ({pct}%)"
+        # Auto-scroll indicator
+        as_flag = " ⟳" if self.scroll_pad.auto_scroll else " ⏸"
+        # Search indicator
+        srch_flag = f" 🔍{self.search_match_idx+1}/{len(self.search_matches)}" \
+                    if self.search_matches else ""
+        status_right = f"{as_flag}{srch_flag}{scroll_info}  {status_flags} "
         status_left  = f" {self.status_msg}"
         gap          = max(0, w - len(status_left) - len(status_right))
         status_line  = status_left + " " * gap + status_right
@@ -2196,9 +2640,14 @@ class LlamaUI:
         except curses.error:
             pass
 
+        # ── History indicator in input line ───────────────────────────────────
+        hist_tag = ""
+        if self.input_hist_idx >= 0:
+            hist_tag = f"[hist {self.input_hist_idx+1}/{len(self.input_history)}] "
+
         # ── Input line ────────────────────────────────────────────────────────
         mode_prompt = {
-            "CHAT": "Chat (!browse url / !web url)",
+            "CHAT": f"Chat{' '+hist_tag if hist_tag else ''}",
             "WEB":  "Web (url / search / b f r l<n> find ask ai bm bml save)",
             "RSS":  "RSS (1–N / add Name URL)",
             "NET":  "Net (p/t/d/s/g/i host)",
